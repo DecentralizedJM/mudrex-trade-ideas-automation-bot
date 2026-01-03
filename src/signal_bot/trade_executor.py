@@ -242,14 +242,12 @@ class TradeExecutor:
             side = "LONG" if signal.signal_type == SignalType.LONG else "SHORT"
             
             if signal.order_type == OrderType.MARKET:
-                # Market order - place without SL/TP first (more reliable)
+                # Market order
                 order = self.client.orders.create_market_order(
                     symbol=signal.symbol,
                     side=side,
                     quantity=qty,
                     leverage=str(actual_leverage),
-                    # FIXED: correct parameter names are stoploss_price and takeprofit_price
-                    # But we'll set them after position opens for reliability
                 )
             else:
                 # Limit order
@@ -263,12 +261,35 @@ class TradeExecutor:
             
             logger.info(f"Order placed successfully: {order}")
             
-            # TODO: After position opens, set SL/TP via positions.set_risk_order()
-            # This is more reliable than passing in initial order
+            # Set SL/TP after order is placed (more reliable than in initial order)
+            sl_tp_set = False
+            if order and (signal.stop_loss or signal.take_profit):
+                try:
+                    positions = self.client.positions.list_open()
+                    position = next(
+                        (p for p in positions if p.symbol == signal.symbol),
+                        None
+                    )
+                    
+                    if position:
+                        self.client.positions.set_risk_order(
+                            position_id=position.position_id,
+                            stoploss_price=str(signal.stop_loss) if signal.stop_loss else None,
+                            takeprofit_price=str(signal.take_profit) if signal.take_profit else None,
+                        )
+                        sl_tp_set = True
+                        logger.info(f"Set SL/TP: SL={signal.stop_loss}, TP={signal.take_profit}")
+                except Exception as e:
+                    logger.warning(f"Failed to set SL/TP: {e}")
+            
+            # Build message
+            msg = f"Order placed: {side} {qty} {signal.symbol} (~${actual_value:.2f})"
+            if signal.stop_loss or signal.take_profit:
+                msg += " | SL/TP set ✓" if sl_tp_set else " | SL/TP pending"
             
             return ExecutionResult(
                 status=ExecutionStatus.SUCCESS,
-                message=f"Order placed: {side} {qty} {signal.symbol} (~${actual_value:.2f})",
+                message=msg,
                 signal_id=signal.signal_id,
                 order=order,
                 quantity=qty

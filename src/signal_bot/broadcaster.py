@@ -256,11 +256,11 @@ class SignalBroadcaster:
             
             # Create order using SDK with proper quantity
             if signal.order_type == OrderType.MARKET:
-                # Market order - skip SL/TP in initial order for reliability
+                # Market order
                 order = client.orders.create_market_order(
                     symbol=signal.symbol,
                     side=side,
-                    quantity=qty,  # FIXED: proper coin quantity, not USDT
+                    quantity=qty,
                     leverage=str(leverage),
                 )
             else:
@@ -269,9 +269,42 @@ class SignalBroadcaster:
                     symbol=signal.symbol,
                     side=side,
                     price=str(signal.entry_price),
-                    quantity=qty,  # FIXED: proper coin quantity
+                    quantity=qty,
                     leverage=str(leverage),
                 )
+            
+            # Set SL/TP after order is placed (more reliable than in initial order)
+            sl_tp_set = False
+            sl_tp_error = None
+            if order and (signal.stop_loss or signal.take_profit):
+                try:
+                    # Find the position for this order
+                    positions = client.positions.list_open()
+                    position = next(
+                        (p for p in positions if p.symbol == signal.symbol),
+                        None
+                    )
+                    
+                    if position:
+                        client.positions.set_risk_order(
+                            position_id=position.position_id,
+                            stoploss_price=str(signal.stop_loss) if signal.stop_loss else None,
+                            takeprofit_price=str(signal.take_profit) if signal.take_profit else None,
+                        )
+                        sl_tp_set = True
+                        logger.info(f"Set SL/TP for {subscriber.telegram_id}: SL={signal.stop_loss}, TP={signal.take_profit}")
+                except Exception as e:
+                    # Log but don't fail the trade - order was already placed successfully
+                    sl_tp_error = str(e)
+                    logger.warning(f"Failed to set SL/TP for {subscriber.telegram_id}: {e}")
+            
+            # Build success message
+            msg = f"{side} {qty} {signal.symbol} (~${actual_value:.2f})"
+            if signal.stop_loss or signal.take_profit:
+                if sl_tp_set:
+                    msg += " | SL/TP set ✓"
+                else:
+                    msg += f" | SL/TP failed: {sl_tp_error}" if sl_tp_error else " | No position for SL/TP"
             
             # Record success
             await self.db.record_trade(
@@ -289,7 +322,7 @@ class SignalBroadcaster:
                 subscriber_id=subscriber.telegram_id,
                 username=subscriber.username,
                 status=TradeStatus.SUCCESS,
-                message=f"{side} {qty} {signal.symbol} (~${actual_value:.2f})",
+                message=msg,
                 order_id=order.order_id,
                 quantity=qty,
                 actual_value=actual_value,
