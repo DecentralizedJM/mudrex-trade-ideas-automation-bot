@@ -11,12 +11,12 @@ This is the core of the centralized system:
 import asyncio
 import logging
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_DOWN
 from enum import Enum
 from typing import List, Optional, Tuple
 
 from mudrex import MudrexClient
 from mudrex.exceptions import MudrexAPIError
+from mudrex.utils import calculate_order_from_usd
 
 from .database import Database, Subscriber
 from .signal_parser import Signal, SignalType, OrderType, SignalUpdate, SignalClose
@@ -42,52 +42,6 @@ class TradeResult:
     order_id: Optional[str] = None
     quantity: Optional[str] = None
     actual_value: Optional[float] = None
-
-
-def calculate_quantity_from_usd(
-    usd_amount: float,
-    price: float,
-    quantity_step: float,
-    min_quantity: float = 0.0,
-    max_quantity: float = float('inf'),
-) -> Tuple[str, float]:
-    """
-    Calculate coin quantity from USD amount.
-    
-    Args:
-        usd_amount: Amount in USD to trade
-        price: Current price of the asset
-        quantity_step: Minimum quantity increment (e.g., 0.001)
-        min_quantity: Minimum allowed quantity
-        max_quantity: Maximum allowed quantity
-        
-    Returns:
-        Tuple of (quantity as string, actual USD value)
-    """
-    if price <= 0:
-        return "0", 0.0
-    
-    # Calculate raw quantity
-    raw_qty = usd_amount / price
-    
-    # Round down to quantity step
-    if quantity_step > 0:
-        step = Decimal(str(quantity_step))
-        qty = Decimal(str(raw_qty)).quantize(step, rounding=ROUND_DOWN)
-    else:
-        qty = Decimal(str(raw_qty))
-    
-    # Apply min/max bounds
-    qty = max(Decimal(str(min_quantity)), qty)
-    qty = min(Decimal(str(max_quantity)), qty)
-    
-    # Calculate actual USD value
-    actual_value = float(qty) * price
-    
-    # Format quantity string (remove trailing zeros)
-    qty_str = f"{qty:f}".rstrip('0').rstrip('.')
-    
-    return qty_str, actual_value
 
 
 class SignalBroadcaster:
@@ -224,17 +178,18 @@ class SignalBroadcaster:
                 margin_type="ISOLATED"
             )
             
-            # FIXED: Calculate proper coin quantity from USD amount
+            # Calculate proper coin quantity from USD amount using SDK helper
             price = signal.entry_price if signal.entry_price else 1.0
-            qty, actual_value = calculate_quantity_from_usd(
+            qty, actual_value = calculate_order_from_usd(
                 usd_amount=subscriber.trade_amount_usdt,
                 price=price,
                 quantity_step=float(asset.quantity_step),
-                min_quantity=float(asset.min_quantity),
-                max_quantity=float(asset.max_quantity),
             )
             
-            if qty == "0" or float(qty) < float(asset.min_quantity):
+            # Validate against min/max
+            min_qty = float(asset.min_quantity)
+            max_qty = float(asset.max_quantity)
+            if qty < min_qty:
                 await self.db.record_trade(
                     telegram_id=subscriber.telegram_id,
                     signal_id=signal.signal_id,
@@ -255,12 +210,15 @@ class SignalBroadcaster:
             side = "LONG" if signal.signal_type == SignalType.LONG else "SHORT"
             
             # Create order using SDK with proper quantity
+            # Note: SDK now auto-rounds quantity, so we can pass it directly
+            qty_str = str(qty)
+            
             if signal.order_type == OrderType.MARKET:
                 # Market order
                 order = client.orders.create_market_order(
                     symbol=signal.symbol,
                     side=side,
-                    quantity=qty,
+                    quantity=qty_str,
                     leverage=str(leverage),
                 )
             else:
@@ -269,7 +227,7 @@ class SignalBroadcaster:
                     symbol=signal.symbol,
                     side=side,
                     price=str(signal.entry_price),
-                    quantity=qty,
+                    quantity=qty_str,
                     leverage=str(leverage),
                 )
             
@@ -299,7 +257,7 @@ class SignalBroadcaster:
                     logger.warning(f"Failed to set SL/TP for {subscriber.telegram_id}: {e}")
             
             # Build success message
-            msg = f"{side} {qty} {signal.symbol} (~${actual_value:.2f})"
+            msg = f"{side} {qty_str} {signal.symbol} (~${actual_value:.2f})"
             if signal.stop_loss or signal.take_profit:
                 if sl_tp_set:
                     msg += " | SL/TP set ✓"
@@ -314,7 +272,7 @@ class SignalBroadcaster:
                 side=side,
                 order_type=signal.order_type.value,
                 status="SUCCESS",
-                quantity=float(qty),
+                quantity=qty,
                 entry_price=signal.entry_price,
             )
             
@@ -324,7 +282,7 @@ class SignalBroadcaster:
                 status=TradeStatus.SUCCESS,
                 message=msg,
                 order_id=order.order_id,
-                quantity=qty,
+                quantity=qty_str,
                 actual_value=actual_value,
             )
             

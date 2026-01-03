@@ -10,13 +10,13 @@ Handles:
 
 import logging
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_DOWN
 from enum import Enum
-from typing import Optional, Tuple
+from typing import Optional
 
 from mudrex import MudrexClient
 from mudrex.models import Order, Position, Asset
 from mudrex.exceptions import MudrexAPIError
+from mudrex.utils import calculate_order_from_usd
 
 from .signal_parser import Signal, SignalType, OrderType, SignalUpdate, SignalClose
 
@@ -42,58 +42,6 @@ class ExecutionResult:
     order: Optional[Order] = None
     position: Optional[Position] = None
     quantity: Optional[str] = None  # Actual quantity traded
-
-
-def calculate_quantity_from_usd(
-    usd_amount: float,
-    price: float,
-    quantity_step: float,
-    min_quantity: float = 0.0,
-    max_quantity: float = float('inf'),
-) -> Tuple[str, float]:
-    """
-    Calculate coin quantity from USD amount.
-    
-    Args:
-        usd_amount: Amount in USD to trade
-        price: Current price of the asset
-        quantity_step: Minimum quantity increment (e.g., 0.001)
-        min_quantity: Minimum allowed quantity
-        max_quantity: Maximum allowed quantity
-        
-    Returns:
-        Tuple of (quantity as string, actual USD value)
-        
-    Example:
-        >>> qty, value = calculate_quantity_from_usd(50.0, 1.905, 0.1)
-        >>> # 50 / 1.905 = 26.24 → rounded to step 0.1 = 26.2
-        >>> print(f"Qty: {qty}, Value: ${value:.2f}")
-        Qty: 26.2, Value: $49.90
-    """
-    if price <= 0:
-        return "0", 0.0
-    
-    # Calculate raw quantity
-    raw_qty = usd_amount / price
-    
-    # Round down to quantity step
-    if quantity_step > 0:
-        step = Decimal(str(quantity_step))
-        qty = Decimal(str(raw_qty)).quantize(step, rounding=ROUND_DOWN)
-    else:
-        qty = Decimal(str(raw_qty))
-    
-    # Apply min/max bounds
-    qty = max(Decimal(str(min_quantity)), qty)
-    qty = min(Decimal(str(max_quantity)), qty)
-    
-    # Calculate actual USD value
-    actual_value = float(qty) * price
-    
-    # Format quantity string (remove trailing zeros)
-    qty_str = f"{qty:f}".rstrip('0').rstrip('.')
-    
-    return qty_str, actual_value
 
 
 class TradeExecutor:
@@ -213,20 +161,20 @@ class TradeExecutor:
                 signal_id=signal.signal_id
             )
         
-        # Step 4: Calculate proper coin quantity from USD amount
+        # Step 4: Calculate proper coin quantity from USD amount using SDK helper
         # For market orders, use entry_price as estimate (or we could fetch current price)
         price = signal.entry_price if signal.entry_price else 1.0
         
-        qty, actual_value = calculate_quantity_from_usd(
+        qty, actual_value = calculate_order_from_usd(
             usd_amount=self.trade_amount_usdt,
             price=price,
             quantity_step=float(asset.quantity_step),
-            min_quantity=float(asset.min_quantity),
-            max_quantity=float(asset.max_quantity),
         )
         
-        if qty == "0" or float(qty) < float(asset.min_quantity):
-            msg = f"Calculated quantity {qty} below minimum {asset.min_quantity}"
+        # Validate against min/max
+        min_qty = float(asset.min_quantity)
+        if qty < min_qty:
+            msg = f"Calculated quantity {qty} below minimum {min_qty}"
             logger.error(msg)
             return ExecutionResult(
                 status=ExecutionStatus.ORDER_FAILED,
@@ -234,7 +182,8 @@ class TradeExecutor:
                 signal_id=signal.signal_id
             )
         
-        logger.info(f"Calculated: {qty} {signal.symbol} (~${actual_value:.2f} USDT)")
+        qty_str = str(qty)
+        logger.info(f"Calculated: {qty_str} {signal.symbol} (~${actual_value:.2f} USDT)")
         
         # Step 5: Place order
         try:
@@ -246,7 +195,7 @@ class TradeExecutor:
                 order = self.client.orders.create_market_order(
                     symbol=signal.symbol,
                     side=side,
-                    quantity=qty,
+                    quantity=qty_str,
                     leverage=str(actual_leverage),
                 )
             else:
@@ -254,7 +203,7 @@ class TradeExecutor:
                 order = self.client.orders.create_limit_order(
                     symbol=signal.symbol,
                     side=side,
-                    quantity=qty,
+                    quantity=qty_str,
                     price=str(signal.entry_price),
                     leverage=str(actual_leverage),
                 )
@@ -405,14 +354,9 @@ class TradeExecutor:
                 # Round to quantity step if we have asset info
                 asset = self._get_asset(position.symbol)
                 if asset:
-                    qty_str, _ = calculate_quantity_from_usd(
-                        usd_amount=close_qty * 1000,  # Dummy high value
-                        price=1000,  # Dummy price
-                        quantity_step=float(asset.quantity_step),
-                    )
-                    # Actually we just need to round the close_qty
                     step = float(asset.quantity_step)
-                    close_qty = int(close_qty / step) * step
+                    if step > 0:
+                        close_qty = round(close_qty / step) * step
                 
                 updated_position = self.client.positions.close_partial(
                     position_id=position_id,
