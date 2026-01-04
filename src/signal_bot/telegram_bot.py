@@ -280,9 +280,30 @@ class SignalBot:
         await update.message.reply_text("🔄 Validating your API credentials...")
         
         try:
+            import asyncio
             from mudrex import MudrexClient
-            client = MudrexClient(api_secret=api_secret)
-            balance = client.wallet.get_futures_balance()
+            
+            def validate_api(secret: str):
+                """Sync validation - runs in thread."""
+                client = MudrexClient(api_secret=secret)
+                return client.wallet.get_futures_balance()
+            
+            # Run in thread with 15 second timeout
+            try:
+                balance = await asyncio.wait_for(
+                    asyncio.to_thread(validate_api, api_secret),
+                    timeout=15.0
+                )
+            except asyncio.TimeoutError:
+                await update.message.reply_text(
+                    "❌ **Validation timed out!**\n\n"
+                    "The API request took too long. Please check:\n"
+                    "1. Your API secret is correct\n"
+                    "2. Mudrex API is accessible\n\n"
+                    "Try again with /register",
+                    parse_mode="Markdown"
+                )
+                return ConversationHandler.END
             
             if balance is None:
                 await update.message.reply_text(
@@ -299,11 +320,11 @@ class SignalBot:
             
         except Exception as e:
             logger.error(f"API validation failed for {user.id}: {e}")
+            # Don't use Markdown - error messages may contain special chars
             await update.message.reply_text(
-                f"❌ **API validation failed!**\n\n"
+                f"❌ API validation failed!\n\n"
                 f"Error: {str(e)[:100]}\n\n"
-                f"Please check your credentials and try /register again.",
-                parse_mode="Markdown"
+                f"Please check your credentials and try /register again."
             )
             return ConversationHandler.END
         
