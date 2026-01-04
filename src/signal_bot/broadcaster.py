@@ -245,6 +245,18 @@ class SignalBroadcaster:
                 quantity_step=float(asset.quantity_step),
             )
             
+            # Check minimum notional value (Mudrex requires ~$5 minimum)
+            MIN_NOTIONAL_USDT = 5.0
+            if actual_value < MIN_NOTIONAL_USDT:
+                return TradeResult(
+                    subscriber_id=subscriber.telegram_id,
+                    username=subscriber.username,
+                    status=TradeStatus.API_ERROR,
+                    message=f"Trade amount ${subscriber.trade_amount_usdt:.2f} is below minimum ${MIN_NOTIONAL_USDT:.0f}. Use /setamount to increase.",
+                    side=signal.signal_type.value,
+                    order_type=signal.order_type.value,
+                )
+            
             # Validate against min/max
             min_qty = float(asset.min_quantity)
             max_qty = float(asset.max_quantity)
@@ -264,6 +276,8 @@ class SignalBroadcaster:
             # Create order using SDK with proper quantity
             # Note: SDK now auto-rounds quantity, so we can pass it directly
             qty_str = str(qty)
+            
+            logger.info(f"Creating order: symbol={signal.symbol}, side={side}, qty={qty_str}, leverage={leverage}, order_type={signal.order_type.value}, entry_price={signal.entry_price}")
             
             if signal.order_type == OrderType.MARKET:
                 # Market order
@@ -462,12 +476,14 @@ Top up your Mudrex wallet to receive future signals.
 """.strip()
     
     else:
+        # Escape special characters in error message for Markdown
+        safe_message = result.message.replace('|', '\\|').replace('_', '\\_').replace('*', '\\*')
         return f"""
 ❌ **Trade Failed**
 ━━━━━━━━━━━━━━━━━━━━
 🆔 Signal: `{signal.signal_id}`
 📊 {signal.signal_type.value} {signal.symbol}
 
-Error: {result.message}
+Error: {safe_message}
 ━━━━━━━━━━━━━━━━━━━━
 """.strip()
